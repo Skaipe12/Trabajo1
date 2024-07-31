@@ -1,7 +1,7 @@
 import pandas as pd
 import requests
 from concurrent.futures import ThreadPoolExecutor
-
+import json
 # Token de acceso a Mapbox
 ACCESS_TOKEN = 'pk.eyJ1Ijoic2thaXBlMTIiLCJhIjoiY2x6NG1mc3UzM3M5bTJxcHMzYjY3OTNmbyJ9.ibafE9lySvin491TdmbkhA'
 
@@ -13,45 +13,65 @@ def extract_coordinates(linestring):
     return u_coords, v_coords
 
 # Llamar a la API de Mapbox para obtener distancia y tiempo
-def get_traffic_info(row, modality):
+def get_traffic_info(row):
     u_coords = row['u_coords']
     v_coords = row['v_coords']
-    url = f"https://api.mapbox.com/directions/v5/mapbox/{modality}/{u_coords[0]},{u_coords[1]};{v_coords[0]},{v_coords[1]}"
+    url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{u_coords[0]},{u_coords[1]};{v_coords[0]},{v_coords[1]}"
     params = {
         'access_token': ACCESS_TOKEN,
         'geometries': 'geojson',
-        'overview': 'simplified',
-        'annotations': 'duration,speed'
+        'overview': 'full',
+        'annotations': 'speed'
     }
     response = requests.get(url, params=params)
     data = response.json()
-    duration = data['routes'][0]['duration']  # en segundos
-    speed = data['routes'][0]['legs'][0]['annotation']['speed'][0]  # en metros por segundo
-    return row['index'], duration, speed
+    if data:
+        #speed va a ser el promedio de las velocidades del array que entrega la API
+        speed = data['routes'][0]['legs'][0]['annotation']['speed']
+        speed = sum(speed) / len(speed)
+        weight = data['routes'][0]['legs'][0].get('weight', None)
+        print(f"Processed {row['index']}")
+        return row['index'], speed, weight
+    else:
+        print(f"Failed to process {row['index']}")
+        return row['index'], None, None, None
 
 # Procesar los datos
-def process_data(data, modality):
+def process_data(data):
     data['u_coords'], data['v_coords'] = zip(*data['geometry'].apply(extract_coordinates))
     data = data.reset_index()
-    durations = [None] * len(data)
     speeds = [None] * len(data)
+    weigths = [None] * len(data)
 
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(get_traffic_info, row, modality) for _, row in data.iterrows()]
+        futures = [executor.submit(get_traffic_info, row) for _, row in data.iterrows()]
         for future in futures:
-            index, duration, speed = future.result()
-            durations[index] = duration
+            index, speed, weigth  = future.result()
             speeds[index] = speed
-
-    data['duration_s'] = durations
-    data['speed_mps'] = speeds
-    data['time_car'] = data['duration_s'] / 60  # Convertir segundos a minutos
-    return data
+            weigths[index] = weigth
+    
+    final_data = data[['u', 'v', 'geometry']].copy()
+    final_data['speed_mps'] = speeds
+    final_data['weigth'] = weigths
+    return final_data
 
 # Cargar datos
 data = pd.read_csv('gdf_edges.csv')
 
 # Ejecutar procesamiento
-final_df = process_data(data[0:100], 'driving')
+#final_df = process_data(data, 'driving')
 
-print(final_df.head())
+# cargar el df
+final_df = pd.read_csv('final_df.csv')
+
+# Convertir el dataframe a JSON con la estructura específica
+def dataframe_to_json(df):
+    json_df = {row['u']: {row['v']: {"velocidad": row['speed_mps'], "peso": row['weigth']}} for index, row in df.iterrows()}
+    return json_df
+
+# Uso de la función con final_df
+json_df = dataframe_to_json(final_df)
+#descarga el json
+with open('final_df.json', 'w') as f:
+    json.dump(json_df, f)
+
